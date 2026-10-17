@@ -1,31 +1,67 @@
 const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const db = require('./db');
-const os = require('os');
 const app = express();
-app.use(express.json());
+app.use(express.json({limit:'1mb'}));
 app.use(express.static('public'));
-const q = (sql, params=[]) => db.prepare(sql).all(params);
-const r = (sql, params=[]) => db.prepare(sql).run(params);
-app.get('/api/dashboard', (req,res)=>{
-  const products=db.prepare('SELECT COUNT(*) n FROM products').get().n;
-  const stock=db.prepare('SELECT COALESCE(SUM(stock),0) n FROM products').get().n;
-  const sales=db.prepare('SELECT COALESCE(SUM(amount),0) n FROM sales WHERE date(created_at)=date(\'now\',\'localtime\')').get().n;
-  const low=db.prepare('SELECT COUNT(*) n FROM products WHERE stock<=min_stock').get().n;
-  res.json({products,stock,sales,low});
-});
+const q=(sql,p=[])=>db.prepare(sql).all(p);
+const g=(sql,p=[])=>db.prepare(sql).get(p);
+const r=(sql,p=[])=>db.prepare(sql).run(p);
+const now=()=>new Date().toISOString();
+const audit=(action,entity,entity_id,details,user_id=null)=>r('INSERT INTO audit_logs(user_id,action,entity,entity_id,details) VALUES(?,?,?,?,?)',[user_id,action,entity,entity_id,JSON.stringify(details||{})]);
+const hashPassword=p=>crypto.scryptSync(String(p),crypto.randomBytes(16),64).toString('hex');
+const checkPassword=(p,h)=>crypto.timingSafeEqual(Buffer.from(hashPasswordWithSalt(String(p),h),'hex'),Buffer.from(h.split('$')[1],'hex'));
+function hashPasswordWithSalt(password,stored){const salt=stored.split('$')[0];return crypto.scryptSync(password,Buffer.from(salt,'hex'),64).toString('hex');}
+function makePassword(password){const salt=crypto.randomBytes(16).toString('hex');return salt+'$'+crypto.scryptSync(String(password),Buffer.from(salt,'hex'),64).toString('hex');}
+function auth(req,res,next){const token=(req.headers.authorization||'').replace(/^Bearer\s+/,'');if(!token)return next();const u=g('SELECT id,name,username,role FROM users WHERE id=? AND active=1',[Number(token)]);if(u)req.user=u;next();}
+app.use(auth);
+app.get('/api/dashboard',(req,res)=>{const products=g('SELECT COUNT(*) n FROM products').n,stock=g('SELECT COALESCE(SUM(stock),0) n FROM products').n,sales=g("SELECT COALESCE(SUM(amount),0) n FROM sales WHERE date(created_at)=date('now','localtime')").n,low=g('SELECT COUNT(*) n FROM products WHERE stock<=min_stock').n;const cash=g("SELECT COALESCE(SUM(CASE WHEN type='in' THEN amount ELSE -amount END),0) n FROM cashbook").n;res.json({products,stock,sales,low,cash});});
 app.get('/api/products',(req,res)=>res.json(q('SELECT * FROM products ORDER BY id DESC')));
-app.post('/api/products',(req,res)=>{const {name,sku,category,price,cost,stock,min_stock}=req.body;r('INSERT INTO products(name,sku,category,price,cost,stock,min_stock) VALUES(?,?,?,?,?,?,?)',[name,sku||null,category||'',Number(price)||0,Number(cost)||0,Number(stock)||0,Number(min_stock)||0]);res.json({ok:true});});
-app.delete('/api/products/:id',(req,res)=>{r('DELETE FROM products WHERE id=?',[req.params.id]);res.json({ok:true});});
-app.post('/api/sales',(req,res)=>{const {product_id,qty,customer}=req.body;const p=db.prepare('SELECT * FROM products WHERE id=?').get(product_id);if(!p)return res.status(404).json({error:'Product not found'});if(Number(qty)>p.stock)return res.status(400).json({error:'Stock haitoshi'});const amount=p.price*Number(qty);const tx=db.transaction(()=>{r('INSERT INTO sales(product_id,qty,amount,customer) VALUES(?,?,?,?)',[p.id,qty,amount,customer||'']);r('UPDATE products SET stock=stock-? WHERE id=?',[qty,p.id]);});tx();res.json({ok:true,amount});});
-app.get('/api/sales',(req,res)=>res.json(q('SELECT s.*,p.name product FROM sales s LEFT JOIN products p ON p.id=s.product_id ORDER BY s.id DESC LIMIT 100')));
+app.post('/api/products',(req,res)=>{try{const {name,sku,category,price,cost,stock,min_stock}=req.body;r('INSERT INTO products(name,sku,category,price,cost,stock,min_stock) VALUES(?,?,?,?,?,?,?)',[name,sku||null,category||'',Number(price)||0,Number(cost)||0,Number(stock)||0,Number(min_stock)||0]);const id=g('SELECT last_insert_rowid() id').id;if(Number(stock))r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[id,'opening',Number(stock),'product','Opening stock',req.user?.id||null]);audit('create','product',id,{name,sku},req.user?.id);res.json({ok:true,id});}catch(e){res.status(400).json({error:e.message});}});
+app.delete('/api/products/:id',(req,res)=>{r('DELETE FROM products WHERE id=?',[req.params.id]);audit('delete','product',Number(req.params.id),{},req.user?.id);res.json({ok:true});});
+app.post('/api/sales',(req,res)=>{const {product_id,qty,customer}=req.body;const p=g('SELECT * FROM products WHERE id=?',[product_id]);if(!p)return res.status(404).json({error:'Product not found'});if(Number(qty)<=0||Number(qty)>p.stock)return res.status(400).json({error:'Stock haitoshi'});const amount=p.price*Number(qty);const tx=db.transaction(()=>{r('INSERT INTO sales(product_id,qty,amount,customer) VALUES(?,?,?,?)',[p.id,qty,amount,customer||'']);r('UPDATE products SET stock=stock-? WHERE id=?',[qty,p.id]);r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[p.id,'sale',-Number(qty),'sale','POS sale',req.user?.id||null]);r("INSERT INTO cashbook(type,title,amount,reference,user_id) VALUES('in','Sale',?,?,?)",[amount,'sale',req.user?.id||null]);});tx();const id=g('SELECT last_insert_rowid() id').id;audit('create','sale',id,{product_id,qty,amount},req.user?.id);res.json({ok:true,id,amount});});
+app.get('/api/sales',(req,res)=>res.json(q('SELECT s.*,p.name product FROM sales s LEFT JOIN products p ON p.id=s.product_id ORDER BY s.id DESC LIMIT 200')));
 app.get('/api/buyer-requests',(req,res)=>res.json(q('SELECT * FROM buyer_requests ORDER BY id DESC')));
 app.post('/api/buyer-requests',(req,res)=>{const {title,details,desired_price}=req.body;r('INSERT INTO buyer_requests(title,details,desired_price) VALUES(?,?,?)',[title,details||'',Number(desired_price)||0]);res.json({ok:true});});
 app.patch('/api/buyer-requests/:id',(req,res)=>{r('UPDATE buyer_requests SET status=? WHERE id=?',[req.body.status||'open',req.params.id]);res.json({ok:true});});
 app.get('/api/customers',(req,res)=>res.json(q('SELECT * FROM customers ORDER BY id DESC')));
 app.post('/api/customers',(req,res)=>{r('INSERT INTO customers(name,phone,email) VALUES(?,?,?)',[req.body.name,req.body.phone||'',req.body.email||'']);res.json({ok:true});});
 app.get('/api/expenses',(req,res)=>res.json(q('SELECT * FROM expenses ORDER BY id DESC')));
-app.post('/api/expenses',(req,res)=>{r('INSERT INTO expenses(title,amount) VALUES(?,?)',[req.body.title,Number(req.body.amount)||0]);res.json({ok:true});});
-app.get('/api/reports',(req,res)=>{res.json({sales:db.prepare('SELECT COALESCE(SUM(amount),0) value FROM sales').get().value,expenses:db.prepare('SELECT COALESCE(SUM(amount),0) value FROM expenses').get().value,stockValue:db.prepare('SELECT COALESCE(SUM(price*stock),0) value FROM products').get().value});});
-app.get('/api/health',(req,res)=>res.json({ok:true,time:new Date().toISOString()}));
+app.post('/api/expenses',(req,res)=>{const amount=Number(req.body.amount)||0;r('INSERT INTO expenses(title,amount) VALUES(?,?)',[req.body.title,amount]);const id=g('SELECT last_insert_rowid() id').id;r("INSERT INTO cashbook(type,title,amount,reference,user_id) VALUES('out',?,?,?,?)",[req.body.title,amount,'expense',req.user?.id||null]);audit('create','expense',id,{amount},req.user?.id);res.json({ok:true,id});});
+// Suppliers
+app.get('/api/suppliers',(req,res)=>res.json(q('SELECT * FROM suppliers ORDER BY id DESC')));
+app.post('/api/suppliers',(req,res)=>{const {name,phone,email,address}=req.body;r('INSERT INTO suppliers(name,phone,email,address) VALUES(?,?,?,?)',[name,phone||'',email||'',address||'']);res.json({ok:true,id:g('SELECT last_insert_rowid() id').id});});
+// Categories / brands
+app.get('/api/categories',(req,res)=>res.json(q('SELECT * FROM categories ORDER BY parent_id,name')));
+app.post('/api/categories',(req,res)=>{r('INSERT INTO categories(name,parent_id) VALUES(?,?)',[req.body.name,req.body.parent_id||null]);res.json({ok:true});});
+app.get('/api/brands',(req,res)=>res.json(q('SELECT * FROM brands ORDER BY name')));
+app.post('/api/brands',(req,res)=>{try{r('INSERT INTO brands(name) VALUES(?)',[req.body.name]);res.json({ok:true});}catch(e){res.status(400).json({error:e.message});}});
+// Purchasing: one request creates purchase + items and increases stock atomically
+app.get('/api/purchases',(req,res)=>res.json(q(`SELECT p.*,s.name supplier FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.id DESC`)));
+app.post('/api/purchases',(req,res)=>{const {supplier_id,invoice_no,items=[]}=req.body;if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'Purchase items required'});try{const tx=db.transaction(()=>{let total=0;const purchase=r('INSERT INTO purchases(supplier_id,invoice_no,total,user_id) VALUES(?,?,0,?)',[supplier_id||null,invoice_no||'',req.user?.id||null]);for(const x of items){const qty=Number(x.qty)||0,cost=Number(x.cost)||0;if(qty<=0)throw new Error('Invalid quantity');const line=qty*cost;total+=line;r('INSERT INTO purchase_items(purchase_id,product_id,qty,cost,total) VALUES(?,?,?,?,?)',[purchase.lastInsertRowid,x.product_id,qty,cost,line]);r('UPDATE products SET stock=stock+?,cost=? WHERE id=?',[qty,cost,x.product_id]);r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[x.product_id,'purchase',qty,'purchase',invoice_no||'',req.user?.id||null]);}r('UPDATE purchases SET total=? WHERE id=?',[total,purchase.lastInsertRowid]);r("INSERT INTO cashbook(type,title,amount,reference,user_id) VALUES('out','Purchase',?,?,?)",[total,invoice_no||'purchase',req.user?.id||null]);return purchase.lastInsertRowid;});const id=tx();audit('create','purchase',id,{invoice_no},req.user?.id);res.json({ok:true,id});}catch(e){res.status(400).json({error:e.message});}});
+// Stock movements
+app.get('/api/stock/movements',(req,res)=>res.json(q(`SELECT m.*,p.name product FROM stock_movements m LEFT JOIN products p ON p.id=m.product_id ORDER BY m.id DESC LIMIT 500`)));
+app.post('/api/stock/movements',(req,res)=>{const {product_id,type,qty,reference,note}=req.body;const n=Number(qty);if(!product_id||!['in','out','adjustment'].includes(type)||!n)return res.status(400).json({error:'Invalid movement'});const delta=type==='out'?-Math.abs(n):Math.abs(n);const tx=db.transaction(()=>{r('UPDATE products SET stock=stock+? WHERE id=?',[delta,product_id]);r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[product_id,type,delta,reference||'',note||'',req.user?.id||null]);});tx();res.json({ok:true});});
+// Returns
+app.get('/api/returns',(req,res)=>res.json(q('SELECT r.*,p.name product FROM returns r LEFT JOIN products p ON p.id=r.product_id ORDER BY r.id DESC')));
+app.post('/api/returns',(req,res)=>{const {sale_id,product_id,qty,reason}=req.body;const p=g('SELECT * FROM products WHERE id=?',[product_id]);const s=g('SELECT * FROM sales WHERE id=? AND product_id=?',[sale_id,product_id]);if(!p||!s)return res.status(404).json({error:'Sale/product not found'});const n=Number(qty);if(n<=0||n>s.qty)return res.status(400).json({error:'Invalid return quantity'});const amount=p.price*n;const tx=db.transaction(()=>{r('INSERT INTO returns(sale_id,product_id,qty,amount,reason,user_id) VALUES(?,?,?,?,?,?)',[sale_id,product_id,n,amount,reason||'',req.user?.id||null]);r('UPDATE products SET stock=stock+? WHERE id=?',[n,product_id]);r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[product_id,'return',n,'return',reason||'',req.user?.id||null]);r("INSERT INTO cashbook(type,title,amount,reference,user_id) VALUES('out','Sales return',?,?,?)",[amount,'return',req.user?.id||null]);});tx();res.json({ok:true,amount});});
+// Cashbook / audit
+app.get('/api/cashbook',(req,res)=>res.json(q('SELECT * FROM cashbook ORDER BY id DESC LIMIT 500')));
+app.post('/api/cashbook',(req,res)=>{const amount=Number(req.body.amount)||0;if(!['in','out'].includes(req.body.type)||amount<=0)return res.status(400).json({error:'Invalid cash entry'});r('INSERT INTO cashbook(type,title,amount,reference,user_id) VALUES(?,?,?,?,?)',[req.body.type,req.body.title,amount,req.body.reference||'',req.user?.id||null]);res.json({ok:true});});
+app.get('/api/audit',(req,res)=>res.json(q('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 500')));
+// Users / local auth
+app.get('/api/users',(req,res)=>res.json(q('SELECT id,name,username,role,active,created_at FROM users ORDER BY id DESC')));
+app.post('/api/users',(req,res)=>{if(!req.body.username||!req.body.password||!req.body.name)return res.status(400).json({error:'name, username and password required'});try{r('INSERT INTO users(name,username,password_hash,role) VALUES(?,?,?,?)',[req.body.name,req.body.username,makePassword(req.body.password),req.body.role||'staff']);res.json({ok:true});}catch(e){res.status(400).json({error:e.message});}});
+app.post('/api/auth/login',(req,res)=>{const u=g('SELECT * FROM users WHERE username=? AND active=1',[req.body.username]);if(!u)return res.status(401).json({error:'Invalid login'});if(!checkPassword(req.body.password,u.password_hash))return res.status(401).json({error:'Invalid login'});res.json({ok:true,token:String(u.id),user:{id:u.id,name:u.name,username:u.username,role:u.role}});});
+// Reports with optional date range
+app.get('/api/reports',(req,res)=>{const from=req.query.from||'1970-01-01',to=req.query.to||'9999-12-31';const sales=g("SELECT COALESCE(SUM(amount),0) value FROM sales WHERE date(created_at) BETWEEN date(?) AND date(?)",[from,to]).value;const expenses=g("SELECT COALESCE(SUM(amount),0) value FROM expenses WHERE date(created_at) BETWEEN date(?) AND date(?)",[from,to]).value;const purchases=g("SELECT COALESCE(SUM(total),0) value FROM purchases WHERE date(created_at) BETWEEN date(?) AND date(?)",[from,to]).value;const returns=g("SELECT COALESCE(SUM(amount),0) value FROM returns WHERE date(created_at) BETWEEN date(?) AND date(?)",[from,to]).value;const stockValue=g('SELECT COALESCE(SUM(cost*stock),0) value FROM products').value;res.json({from,to,sales,expenses,purchases,returns,stockValue,net:sales-expenses-returns});});
+app.get('/api/reports/daily',(req,res)=>res.json(q(`SELECT date(created_at) day,COALESCE(SUM(amount),0) sales FROM sales GROUP BY date(created_at) ORDER BY day DESC LIMIT 31`)));
+// Backup: copy the live SQLite database after checkpointing WAL
+app.get('/api/backup',(req,res)=>{try{db.pragma('wal_checkpoint(TRUNCATE)');const file=path.join(__dirname,'data','soko_langu.db');res.download(file,'soko_langu-backup.db');}catch(e){res.status(500).json({error:e.message});}});
+app.get('/api/settings',(req,res)=>res.json(q('SELECT * FROM settings ORDER BY key')));
+app.post('/api/settings',(req,res)=>{r('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',[req.body.key,String(req.body.value??'')]);res.json({ok:true});});
+app.get('/api/health',(req,res)=>res.json({ok:true,time:now(),db:'sqlite',offline:true}));
 const port=process.env.PORT||8080;
 app.listen(port,'0.0.0.0',()=>console.log(`Soko Langu running on http://0.0.0.0:${port}`));
