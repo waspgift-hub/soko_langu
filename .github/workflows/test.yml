@@ -1,0 +1,19 @@
+name: Soko Langu Test
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: node --check server.js
+      - run: node --check db.js
+      - run: node --check accounting.js
+      - run: node --check rbac.js
+      - run: node --check phase4.js
