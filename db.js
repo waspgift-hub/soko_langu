@@ -34,4 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_stock_product ON stock_movements(product_id,creat
 CREATE INDEX IF NOT EXISTS idx_cashbook_created ON cashbook(created_at);
 CREATE INDEX IF NOT EXISTS idx_journal_date ON journal_entries(entry_date);
 `);
+// First-run local admin. Change this password after logging in.
+if(!db.prepare('SELECT id FROM users WHERE username=?').get('admin')){
+ db.prepare('INSERT INTO users(name,username,password_hash,role) VALUES(?,?,?,?)').run('Administrator','admin','4cd1634c30984355a8a7eff9d7488205$8f9f62ec5491268e89db2f7d4506c9ac5dc941c19cabdf042cc1847497ac7dd13dfe9cfd720475d1122f5daea86161044c4dbea3c85cf6a0e6718db4bfe68712','admin');
+}
 module.exports = db;
