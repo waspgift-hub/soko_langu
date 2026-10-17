@@ -2,63 +2,35 @@ module.exports = function registerAccounting(app, db){
   const q=(sql,p=[])=>db.prepare(sql).all(p);
   const g=(sql,p=[])=>db.prepare(sql).get(p);
   const r=(sql,p=[])=>db.prepare(sql).run(p);
-
   const defaults=[
     ['1000','Cash','asset'],['1100','Accounts Receivable','asset'],['1200','Inventory','asset'],
     ['2000','Accounts Payable','liability'],['3000','Owner Equity','equity'],
     ['4000','Sales Revenue','income'],['4100','Other Income','income'],
-    ['5000','Cost of Goods Sold','expense'],['5100','Operating Expenses','expense']
+    ['5000','Cost of Goods Sold','expense'],['5100','Operating Expenses','expense'],['4200','Sales Returns','income']
   ];
-  const seed= db.transaction(()=>defaults.forEach(x=>r('INSERT OR IGNORE INTO accounts(code,name,type) VALUES(?,?,?)',x)));
-  seed();
-
+  db.transaction(()=>defaults.forEach(x=>r('INSERT OR IGNORE INTO accounts(code,name,type) VALUES(?,?,?)',x)))();
+  const aid=code=>g('SELECT id FROM accounts WHERE code=?',[code]).id;
+  const post=(reference,title,date,lines,userId)=>{
+    if(g('SELECT id FROM journal_entries WHERE reference=?',[reference])) return false;
+    const clean=lines.filter(x=>Number(x.debit||0)||Number(x.credit||0));
+    const debit=clean.reduce((s,x)=>s+Number(x.debit||0),0),credit=clean.reduce((s,x)=>s+Number(x.credit||0),0);
+    if(Math.abs(debit-credit)>0.005) throw new Error('Unbalanced journal');
+    db.transaction(()=>{const e=r('INSERT INTO journal_entries(reference,title,entry_date,user_id) VALUES(?,?,COALESCE(?,CURRENT_TIMESTAMP),?)',[reference,title,date||null,userId||null]);clean.forEach(x=>r('INSERT INTO journal_lines(entry_id,account_id,debit,credit) VALUES(?,?,?,?)',[e.lastInsertRowid,x.account_id,Number(x.debit||0),Number(x.credit||0)]));})();
+    return true;
+  };
   app.get('/api/accounting/accounts',(req,res)=>res.json(q('SELECT * FROM accounts ORDER BY code')));
-
-  app.post('/api/accounting/accounts',(req,res)=>{
-    const {code,name,type}=req.body;
-    if(!code||!name||!['asset','liability','equity','income','expense'].includes(type)) return res.status(400).json({error:'code, name and valid type required'});
-    try{r('INSERT INTO accounts(code,name,type) VALUES(?,?,?)',[code,name,type]);res.json({ok:true});}
-    catch(e){res.status(400).json({error:e.message});}
-  });
-
+  app.post('/api/accounting/accounts',(req,res)=>{const {code,name,type}=req.body;if(!code||!name||!['asset','liability','equity','income','expense'].includes(type))return res.status(400).json({error:'code, name and valid type required'});try{r('INSERT INTO accounts(code,name,type) VALUES(?,?,?)',[code,name,type]);res.json({ok:true})}catch(e){res.status(400).json({error:e.message})}});
   app.get('/api/accounting/journal',(req,res)=>res.json(q(`SELECT e.*,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM journal_entries e LEFT JOIN journal_lines l ON l.entry_id=e.id GROUP BY e.id ORDER BY e.id DESC LIMIT 500`)));
-
-  app.post('/api/accounting/journal',(req,res)=>{
-    const {title,reference,entry_date,lines=[]}=req.body;
-    if(!title||!Array.isArray(lines)||lines.length<2) return res.status(400).json({error:'Journal requires at least two lines'});
-    const clean=lines.map(x=>({account_id:Number(x.account_id),debit:Number(x.debit)||0,credit:Number(x.credit)||0})).filter(x=>x.account_id&&(x.debit>0||x.credit>0));
-    const debit=clean.reduce((a,x)=>a+x.debit,0),credit=clean.reduce((a,x)=>a+x.credit,0);
-    if(!clean.length||Math.abs(debit-credit)>0.005)return res.status(400).json({error:'Debits and credits must balance'});
-    const tx=db.transaction(()=>{const e=r('INSERT INTO journal_entries(reference,title,entry_date,user_id) VALUES(?,?,COALESCE(?,CURRENT_TIMESTAMP),?)',[reference||'',title,entry_date||null,req.user?.id||null]);for(const x of clean)r('INSERT INTO journal_lines(entry_id,account_id,debit,credit) VALUES(?,?,?,?)',[e.lastInsertRowid,x.account_id,x.debit,x.credit]);return e.lastInsertRowid;});
-    res.json({ok:true,id:tx(),debit,credit});
-  });
-
-  app.get('/api/accounting/trial-balance',(req,res)=>{
-    const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id ORDER BY a.code`);
-    res.json(rows.map(x=>({...x,balance:x.debit-x.credit})));
-  });
-
-  app.get('/api/accounting/pnl',(req,res)=>{
-    const from=req.query.from||'1970-01-01',to=req.query.to||'9999-12-31';
-    const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id LEFT JOIN journal_entries e ON e.id=l.entry_id AND date(e.entry_date) BETWEEN date(?) AND date(?) WHERE a.type IN ('income','expense') GROUP BY a.id ORDER BY a.code`,[from,to]);
-    const income=rows.filter(x=>x.type==='income').reduce((s,x)=>s+x.credit-x.debit,0);
-    const expenses=rows.filter(x=>x.type==='expense').reduce((s,x)=>s+x.debit-x.credit,0);
-    res.json({from,to,income,expenses,profit:income-expenses,accounts:rows});
-  });
-
-  app.get('/api/accounting/balance-sheet',(req,res)=>{
-    const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id ORDER BY a.code`);
-    const assets=rows.filter(x=>x.type==='asset').reduce((s,x)=>s+x.debit-x.credit,0);
-    const liabilities=rows.filter(x=>x.type==='liability').reduce((s,x)=>s+x.credit-x.debit,0);
-    const equity=rows.filter(x=>x.type==='equity').reduce((s,x)=>s+x.credit-x.debit,0);
-    const retained=rows.filter(x=>x.type==='income').reduce((s,x)=>s+x.credit-x.debit,0)-rows.filter(x=>x.type==='expense').reduce((s,x)=>s+x.debit-x.credit,0);
-    res.json({assets,liabilities,equity,retainedEarnings:retained,totalLiabilitiesEquity:liabilities+equity+retained,accounts:rows});
-  });
-
-  app.get('/api/accounting/cash-flow',(req,res)=>{
-    const from=req.query.from||'1970-01-01',to=req.query.to||'9999-12-31';
-    const rows=q(`SELECT type,COALESCE(SUM(amount),0) amount FROM cashbook WHERE date(created_at) BETWEEN date(?) AND date(?) GROUP BY type`,[from,to]);
-    const cashIn=(rows.find(x=>x.type==='in')||{}).amount||0,cashOut=(rows.find(x=>x.type==='out')||{}).amount||0;
-    res.json({from,to,cashIn,cashOut,netCash:cashIn-cashOut});
-  });
+  app.post('/api/accounting/journal',(req,res)=>{const {title,reference,entry_date,lines=[]}=req.body;if(!title||!Array.isArray(lines)||lines.length<2)return res.status(400).json({error:'Journal requires at least two lines'});const clean=lines.map(x=>({account_id:Number(x.account_id),debit:Number(x.debit)||0,credit:Number(x.credit)||0})).filter(x=>x.account_id&&(x.debit>0||x.credit>0));const debit=clean.reduce((a,x)=>a+x.debit,0),credit=clean.reduce((a,x)=>a+x.credit,0);if(!clean.length||Math.abs(debit-credit)>0.005)return res.status(400).json({error:'Debits and credits must balance'});try{post(reference||`MANUAL-${Date.now()}`,title,entry_date,clean,req.user?.id);res.json({ok:true,debit,credit})}catch(e){res.status(400).json({error:e.message})}});
+  app.post('/api/accounting/sync',(req,res)=>{try{let created=0;for(const s of q('SELECT s.*,p.cost FROM sales s LEFT JOIN products p ON p.id=s.product_id')){const c=(s.cost||0)*s.qty;if(post(`SALE-${s.id}`,'Sale '+s.id,s.created_at,[{account_id:aid('1000'),debit:s.amount,credit:0},{account_id:aid('4000'),debit:0,credit:s.amount}],s.user_id))created++;if(c>0&&post(`COGS-${s.id}`,'COGS sale '+s.id,s.created_at,[{account_id:aid('5000'),debit:c,credit:0},{account_id:aid('1200'),debit:0,credit:c}],s.user_id))created++;}
+      for(const p of q('SELECT * FROM purchases')){if(post(`PURCHASE-${p.id}`,'Purchase '+p.id,p.created_at,[{account_id:aid('1200'),debit:p.total,credit:0},{account_id:aid('1000'),debit:0,credit:p.total}],p.user_id))created++;}
+      for(const e of q('SELECT * FROM expenses')){if(post(`EXPENSE-${e.id}`,'Expense '+e.title,e.created_at,[{account_id:aid('5100'),debit:e.amount,credit:0},{account_id:aid('1000'),debit:0,credit:e.amount},],null))created++;}
+      for(const x of q("SELECT * FROM cashbook WHERE reference NOT LIKE 'sale' AND reference NOT LIKE 'expense' AND reference NOT LIKE 'purchase' AND reference NOT LIKE 'return'")){if(x.type==='in'&&post(`CASH-${x.id}`,'Cash in '+x.title,x.created_at,[{account_id:aid('1000'),debit:x.amount,credit:0},{account_id:aid('4100'),debit:0,credit:x.amount}],x.user_id))created++;if(x.type==='out'&&post(`CASH-${x.id}`,'Cash out '+x.title,x.created_at,[{account_id:aid('5100'),debit:x.amount,credit:0},{account_id:aid('1000'),debit:0,credit:x.amount}],x.user_id))created++;}
+      res.json({ok:true,created})
+    }catch(e){res.status(400).json({error:e.message})}});
+  app.get('/api/accounting/reconciliation',(req,res)=>{const operational={sales:g('SELECT COALESCE(SUM(amount),0) n FROM sales').n,expenses:g('SELECT COALESCE(SUM(amount),0) n FROM expenses').n,purchases:g('SELECT COALESCE(SUM(total),0) n FROM purchases').n,cash:g("SELECT COALESCE(SUM(CASE WHEN type='in' THEN amount ELSE -amount END),0) n FROM cashbook").n};const journal={revenue:g("SELECT COALESCE(SUM(l.credit-l.debit),0) n FROM journal_lines l JOIN accounts a ON a.id=l.account_id WHERE a.code='4000'").n,expenses:g("SELECT COALESCE(SUM(l.debit-l.credit),0) n FROM journal_lines l JOIN accounts a ON a.id=l.account_id WHERE a.code='5100'").n,cash:g("SELECT COALESCE(SUM(l.debit-l.credit),0) n FROM journal_lines l JOIN accounts a ON a.id=l.account_id WHERE a.code='1000'").n};res.json({operational,journal,differences:{sales:operational.sales-journal.revenue,expenses:operational.expenses-journal.expenses,cash:operational.cash-journal.cash}})});
+  app.get('/api/accounting/trial-balance',(req,res)=>{const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id ORDER BY a.code`);res.json(rows.map(x=>({...x,balance:x.debit-x.credit})))});
+  app.get('/api/accounting/pnl',(req,res)=>{const from=req.query.from||'1970-01-01',to=req.query.to||'9999-12-31';const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id LEFT JOIN journal_entries e ON e.id=l.entry_id AND date(e.entry_date) BETWEEN date(?) AND date(?) WHERE a.type IN ('income','expense') GROUP BY a.id ORDER BY a.code`,[from,to]);const income=rows.filter(x=>x.type==='income').reduce((s,x)=>s+x.credit-x.debit,0),expenses=rows.filter(x=>x.type==='expense').reduce((s,x)=>s+x.debit-x.credit,0);res.json({from,to,income,expenses,profit:income-expenses,accounts:rows})});
+  app.get('/api/accounting/balance-sheet',(req,res)=>{const rows=q(`SELECT a.code,a.name,a.type,COALESCE(SUM(l.debit),0) debit,COALESCE(SUM(l.credit),0) credit FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id ORDER BY a.code`);const assets=rows.filter(x=>x.type==='asset').reduce((s,x)=>s+x.debit-x.credit,0),liabilities=rows.filter(x=>x.type==='liability').reduce((s,x)=>s+x.credit-x.debit,0),equity=rows.filter(x=>x.type==='equity').reduce((s,x)=>s+x.credit-x.debit,0),retained=rows.filter(x=>x.type==='income').reduce((s,x)=>s+x.credit-x.debit,0)-rows.filter(x=>x.type==='expense').reduce((s,x)=>s+x.debit-x.credit,0);res.json({assets,liabilities,equity,retainedEarnings:retained,totalLiabilitiesEquity:liabilities+equity+retained,accounts:rows})});
+  app.get('/api/accounting/cash-flow',(req,res)=>{const from=req.query.from||'1970-01-01',to=req.query.to||'9999-12-31';const rows=q(`SELECT type,COALESCE(SUM(amount),0) amount FROM cashbook WHERE date(created_at) BETWEEN date(?) AND date(?) GROUP BY type`,[from,to]);const cashIn=(rows.find(x=>x.type==='in')||{}).amount||0,cashOut=(rows.find(x=>x.type==='out')||{}).amount||0;res.json({from,to,cashIn,cashOut,netCash:cashIn-cashOut})});
 };
