@@ -16,6 +16,8 @@ function makePassword(password){const salt=crypto.randomBytes(16).toString('hex'
 function checkPassword(p,h){try{return crypto.timingSafeEqual(Buffer.from(hashPasswordWithSalt(String(p),h),'hex'),Buffer.from(h.split('$')[1],'hex'));}catch{return false;}}
 function auth(req,res,next){const token=(req.headers.authorization||'').replace(/^Bearer\s+/,'');if(!token)return next();const u=g('SELECT id,name,username,role FROM users WHERE id=? AND active=1',[Number(token)]);if(u)req.user=u;next();}
 app.use(auth);
+// RBAC must run before route handlers so permissions are actually enforced.
+require('./rbac')(app,db);
 app.get('/api/dashboard',(req,res)=>{const products=g('SELECT COUNT(*) n FROM products').n,stock=g('SELECT COALESCE(SUM(stock),0) n FROM products').n,sales=g("SELECT COALESCE(SUM(amount),0) n FROM sales WHERE date(created_at)=date('now','localtime')").n,low=g('SELECT COUNT(*) n FROM products WHERE stock<=min_stock').n;const cash=g("SELECT COALESCE(SUM(CASE WHEN type='in' THEN amount ELSE -amount END),0) n FROM cashbook").n;res.json({products,stock,sales,low,cash});});
 app.get('/api/products',(req,res)=>res.json(q('SELECT * FROM products ORDER BY id DESC')));
 app.post('/api/products',(req,res)=>{try{const {name,sku,category,price,cost,stock,min_stock}=req.body;r('INSERT INTO products(name,sku,category,price,cost,stock,min_stock) VALUES(?,?,?,?,?,?,?)',[name,sku||null,category||'',Number(price)||0,Number(cost)||0,Number(stock)||0,Number(min_stock)||0]);const id=g('SELECT last_insert_rowid() id').id;if(Number(stock))r('INSERT INTO stock_movements(product_id,type,qty,reference,note,user_id) VALUES(?,?,?,?,?,?)',[id,'opening',Number(stock),'product','Opening stock',req.user?.id||null]);audit('create','product',id,{name,sku},req.user?.id);res.json({ok:true,id});}catch(e){res.status(400).json({error:e.message});}});
@@ -55,6 +57,5 @@ app.post('/api/settings',(req,res)=>{r('INSERT INTO settings(key,value) VALUES(?
 app.get('/api/health',(req,res)=>res.json({ok:true,time:now(),db:'sqlite',offline:true}));
 require('./accounting')(app,db);
 require('./phase4')(app,db);
-require('./rbac')(app,db);
 const port=process.env.PORT||8080;
 app.listen(port,'0.0.0.0',()=>console.log(`Soko Langu running on http://0.0.0.0:${port}`));
