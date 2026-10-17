@@ -54,5 +54,6 @@ app.get('/api/settings',(req,res)=>res.json(q('SELECT * FROM settings ORDER BY k
 app.post('/api/settings',(req,res)=>{r('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',[req.body.key,String(req.body.value??'')]);res.json({ok:true});});
 app.get('/api/health',(req,res)=>res.json({ok:true,time:now(),db:'sqlite',offline:true}));
 require('./accounting')(app,db);
+require('./phase4')(app,db);
 const port=process.env.PORT||8080;
 app.listen(port,'0.0.0.0',()=>console.log(`Soko Langu running on http://0.0.0.0:${port}`));
